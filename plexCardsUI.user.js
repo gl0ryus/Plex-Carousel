@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.2.4
+// @version      3.2.6
 // @description  16:9 backdrop cards, a Recently Added hero carousel, and a streamlined top bar (pinned libraries + collapsible search) for Plex Web
 // @author       gl0ryus
 // @license      MIT
@@ -69,7 +69,7 @@ GM_addStyle(`
 .plex-hero-ambient {
   position: absolute; inset: 10px -10px -90px;
   background-size: cover; background-position: center 25%;
-  filter: blur(70px) saturate(1.8); opacity: 0.55;
+  filter: blur(45px) saturate(1.6); opacity: 0.55; transform: translateZ(0);
   border-radius: 20px; pointer-events: none;
   transition: opacity 0.7s ease; z-index: 0;
 }
@@ -116,7 +116,7 @@ GM_addStyle(`
 #plex-ambient-global {
   position: fixed; inset: 0;
   background-size: cover; background-position: center 25%;
-  filter: blur(120px) saturate(1.5);
+  filter: blur(60px) saturate(1.4); transform: translateZ(0); will-change: opacity;
   opacity: 0; pointer-events: none; z-index: 0;
   transition: opacity 0.7s ease;
 }
@@ -125,9 +125,9 @@ body, #plex { background: transparent !important; }
 .dark-scrollbar { background: transparent !important; }
 [class*="FullPage-container"] { background: transparent !important; }
 body.plex-topnav [class*="NavBar-container"] {   /* floating dark pill nav over the ambient blur */
-  background: rgba(0,0,0,0.55) !important; border-radius: 16px !important; margin: 10px 14px !important;
+  background: rgba(0,0,0,0.6) !important; border-radius: 16px !important; margin: 10px 14px !important;
   border: 1px solid rgba(255,255,255,0.06) !important; box-shadow: 0 8px 26px rgba(0,0,0,0.5) !important;
-  -webkit-backdrop-filter: blur(16px) saturate(1.2) !important; backdrop-filter: blur(16px) saturate(1.2) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(1.2) !important; backdrop-filter: blur(10px) saturate(1.2) !important;
 }
 html body [class*="PageHeader-pageHeader"] { display: none !important; }
 [class*="MetadataPosterCardBadge-badge"], [class*="MetadataPosterCardBadge-topRightBadge"] { display: none !important; }
@@ -194,10 +194,12 @@ body.plex-topnav [class*="SourceSidebar-collapsedSidebar"] { display: none !impo
 body.plex-topnav [class*="SourceSidebar-sidebarUnderlay"] { width: 0 !important; min-width: 0 !important; overflow: hidden !important; }
 /* ── Immersive home: carousel rests below the nav; content scrolls behind the frosted nav; ambient blur replaces Plex's flat backdrop ── */
 body.plex-home [class*="FullPageBackground-backgroundContainer"] { background: transparent !important; }
-body.plex-home [class*="FullPageBackground"] canvas { opacity: 0 !important; }
+body.plex-home [class*="FullPageBackground"] canvas { display: none !important; }
 body.plex-home [class*="Page-pageScroller"] { height: 100vh !important; }
 body.plex-home .plex-hero-wrapper { margin-top: 68px !important; }   /* carousel sits below the nav at rest */
 body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5) !important; }
+/* The header float pulls the expanded library drawer up under the nav, so pad its content down to clear the floating pill. */
+body.plex-home [class*="SourceSidebarContent-expandedSidebarContent"] { padding-top: 68px !important; }
 `);
 
 (function () {
@@ -323,6 +325,8 @@ function applyCardFix(img, cardContainers) {
 }
 
 const pendingImages = new Set();
+let retryScheduled = false;
+let retryFrames    = 0;
 
 function processImage(img) {
   if (!isHomePage()) return;
@@ -337,6 +341,7 @@ function processImage(img) {
   const cardContainers = collectPortraitContainers(img);
   if (cardContainers.length === 0) {
     pendingImages.add(img);
+    retryFrames = 0;   // fresh work — restart the retry budget
   } else {
     applyCardFix(img, cardContainers);
   }
@@ -355,8 +360,10 @@ function retryPending() {
 }
 
 function scheduleRetry() {
-  if (pendingImages.size === 0) return;
-  requestAnimationFrame(() => { retryPending(); scheduleRetry(); });
+  if (retryScheduled || pendingImages.size === 0) return;                       // don't stack rAF loops
+  if (retryFrames++ > 90) { pendingImages.clear(); retryFrames = 0; return; }    // give up on stuck images (~1.5s)
+  retryScheduled = true;
+  requestAnimationFrame(() => { retryScheduled = false; retryPending(); scheduleRetry(); });
 }
 
 function scanTree(root) {
@@ -364,6 +371,10 @@ function scanTree(root) {
   let hadPending = false;
   imgs.forEach(img => { processImage(img); if (pendingImages.has(img)) hadPending = true; });
   if (hadPending) scheduleRetry();
+}
+
+// Whole-page upkeep — runs once per mutation batch (not per added node) to avoid redundant queries.
+function runMaintenance() {
   hideHomeBar();
   setupTopNav();
   applyImmersiveHome();
@@ -388,8 +399,11 @@ const observer = new MutationObserver(mutations => {
       hadNew = true;
     }
   }
-  if (hadNew && pendingImages.size > 0) scheduleRetry();
-  if (hadNew && heroEl) guardCarousel();
+  if (hadNew) {
+    runMaintenance();
+    if (pendingImages.size > 0) scheduleRetry();
+    if (heroEl) guardCarousel();
+  }
 });
 
 let heroTimerId        = null;
@@ -500,7 +514,7 @@ function init() {
   observer.observe(document.documentElement, OBSERVER_CONFIG);
   injectSkeleton();
   scanTree(document.documentElement);
-  applyImmersiveHome();
+  runMaintenance();
   window.addEventListener('hashchange', () => {
     if (!isHomePage()) {
       removeSkeleton();
