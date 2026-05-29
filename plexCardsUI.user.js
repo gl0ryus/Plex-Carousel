@@ -1,12 +1,17 @@
 // ==UserScript==
-// @name         Plex carousel
-// @author       g0ryus
+// @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      1.0
-// @description  16:9 backdrop cards + Recently Added hero carousel for Plex Web
+// @version      3.2.3
+// @description  16:9 backdrop cards, a Recently Added hero carousel, and a streamlined top bar (pinned libraries + collapsible search) for Plex Web
+// @author       gl0ryus
+// @license      MIT
 // @match        https://app.plex.tv/*
 // @grant        GM_addStyle
 // @run-at       document-start
+// @homepageURL  https://github.com/gl0ryus/Plex-Carousel
+// @supportURL   https://github.com/gl0ryus/Plex-Carousel/issues
+// @downloadURL  https://raw.githubusercontent.com/gl0ryus/Plex-Carousel/main/plexCardsUI.user.js
+// @updateURL    https://raw.githubusercontent.com/gl0ryus/Plex-Carousel/main/plexCardsUI.user.js
 // ==/UserScript==
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -29,6 +34,9 @@ const CAROUSEL_CONTENT    = 'shows'; // 'shows' | 'movies' | 'both'
 const RECENT_ITEMS_LIMIT  = 50;   // items fetched per library section from the API
 const SKELETON_TIMEOUT_MS = 6000; // ms before loading skeleton is force-removed
 const SUMMARY_MAX_LENGTH  = 220;  // max characters shown in carousel item summary
+
+const ENABLE_TOP_NAV       = true; // move pinned libraries into the top bar + collapsible search icon
+const NAV_SEARCH_WIDTH     = 480;  // px width of the search box when expanded
 // ── END CONFIG ───────────────────────────────────────────────────────────────
 
 GM_addStyle(`
@@ -159,6 +167,26 @@ img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: ce
   text-shadow: 0 0 4px rgba(0,0,0,1), 0 0 12px rgba(0,0,0,0.8), 0 0 24px rgba(0,0,0,0.4) !important;
   display: block !important; letter-spacing: 0.04em !important;
 }
+/* ── Top-nav rework: pinned libraries + collapsible search ────────────────── */
+#plex-pinned-topbar { display: flex; flex: 1 1 auto; align-items: center; justify-content: center; gap: 26px; height: 48px; transition: opacity 0.2s ease; }
+.plex-pin {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+  font-size: 16px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase;
+  color: rgba(255,255,255,0.85); background: none; border: none; cursor: pointer; padding: 0;
+  white-space: nowrap; transition: color 0.15s ease;
+}
+.plex-pin:hover { color: #fff; }
+.plex-pin.active { color: #E5A00D; }
+#plex-pinned-topbar.plex-dim { opacity: 0.12; pointer-events: none; }
+.plex-search-collapsible {
+  position: absolute !important; top: 50%; transform: translateY(-50%);
+  width: 46px !important; min-width: 0 !important; flex: none !important;
+  overflow: hidden; z-index: 30; transition: width 0.25s ease;
+}
+.plex-search-collapsible.plex-search-open { width: var(--plex-search-width, 480px) !important; overflow: visible; }
+.plex-search-collapsible > div:first-child { width: 100% !important; }
+body.plex-topnav [class*="SourceSidebar-collapsedSidebar"] { display: none !important; }
+body.plex-topnav [class*="SourceSidebar-sidebarUnderlay"] { width: 0 !important; min-width: 0 !important; overflow: hidden !important; }
 `);
 
 (function () {
@@ -268,10 +296,26 @@ function overlayCardText(img) {
   if (spanEl)  spanEl.dataset.plexRole  = 'episode';
 }
 
+// Resize the portrait card to 16:9, overlay its text, and revert on image load error.
+function applyCardFix(img, cardContainers) {
+  const cardOrigH    = cardContainers[0].origH;
+  const newCardH     = Math.round(cardContainers[0].origW * TARGET_RATIO);
+  const rowContainer = findRowContainer(img, cardOrigH);
+  applyFixes(cardContainers, rowContainer, newCardH);
+  overlayCardText(img);
+  img.addEventListener('error', () => {
+    img.dataset.plexFallback = '1';
+    delete img.dataset.plexProcessed;
+    revertFixes(cardContainers, rowContainer);
+    img.src = img.dataset.origSrc;
+  }, { once: true });
+}
+
 const pendingImages = new Set();
 
 function processImage(img) {
   if (!isHomePage()) return;
+  if (img.closest('[class*="SearchResult"]')) return;   // leave search dropdown thumbnails alone
   if (img.dataset.plexProcessed || img.dataset.plexFallback) return;
   const src = img.src || img.getAttribute('data-src') || '';
   if (!isPlexTranscodeUrl(src)) return;
@@ -283,17 +327,7 @@ function processImage(img) {
   if (cardContainers.length === 0) {
     pendingImages.add(img);
   } else {
-    const cardOrigH = cardContainers[0].origH;
-    const newCardH  = Math.round(cardContainers[0].origW * TARGET_RATIO);
-    const rowContainer = findRowContainer(img, cardOrigH);
-    applyFixes(cardContainers, rowContainer, newCardH);
-    overlayCardText(img);
-    img.addEventListener('error', () => {
-      img.dataset.plexFallback = '1';
-      delete img.dataset.plexProcessed;
-      revertFixes(cardContainers, rowContainer);
-      img.src = img.dataset.origSrc;
-    }, { once: true });
+    applyCardFix(img, cardContainers);
   }
   if (img.src) img.src = backdropSrc;
   else img.setAttribute('data-src', backdropSrc);
@@ -305,17 +339,7 @@ function retryPending() {
     const cardContainers = collectPortraitContainers(img);
     if (cardContainers.length === 0) continue;
     pendingImages.delete(img);
-    const cardOrigH = cardContainers[0].origH;
-    const newCardH  = Math.round(cardContainers[0].origW * TARGET_RATIO);
-    const rowContainer = findRowContainer(img, cardOrigH);
-    applyFixes(cardContainers, rowContainer, newCardH);
-    overlayCardText(img);
-    img.addEventListener('error', () => {
-      img.dataset.plexFallback = '1';
-      delete img.dataset.plexProcessed;
-      revertFixes(cardContainers, rowContainer);
-      img.src = img.dataset.origSrc;
-    }, { once: true });
+    applyCardFix(img, cardContainers);
   }
 }
 
@@ -330,6 +354,7 @@ function scanTree(root) {
   imgs.forEach(img => { processImage(img); if (pendingImages.has(img)) hadPending = true; });
   if (hadPending) scheduleRetry();
   hideHomeBar();
+  setupTopNav();
   maybeInitCarousel();
 }
 
@@ -374,6 +399,60 @@ function hideHomeBar() {
   }).observe(bar, { attributes: true, attributeFilter: ['style'] });
 }
 
+function setupTopNav() {
+  if (!ENABLE_TOP_NAV) return;
+  const nav = document.querySelector('[class*="NavBar-container"]');
+  if (!nav || !nav.children[0]) return;
+  const leftSection = nav.children[0];
+  const logo   = leftSection.querySelector('[class*="logoContainer"]');
+  const search = leftSection.querySelector('[class*="UniversalSearch-searchInputContainer"]');
+  if (!logo || !search) return;
+
+  // Build the pinned-library buttons once. Home is dropped (the Plex logo already goes home).
+  if (!document.getElementById('plex-pinned-topbar')) {
+    const pinSrc = [...document.querySelectorAll('[class*="SourceSidebarLink-sourceLink"]')]
+      .filter(o => !/HomeSourceLink/i.test(o.className || '') &&
+                   (o.getAttribute('aria-label') || o.textContent || '').trim().toLowerCase() !== 'home');
+    if (!pinSrc.length) return;   // sidebar links not in the DOM yet — a later mutation retries
+    const bar = document.createElement('div');
+    bar.id = 'plex-pinned-topbar';
+    pinSrc.forEach(orig => {
+      const btn = document.createElement('button');
+      btn.className = 'plex-pin';
+      btn.textContent = orig.getAttribute('aria-label') || orig.textContent.trim();
+      btn.addEventListener('click', () => {
+        orig.click();
+        bar.querySelectorAll('.plex-pin').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+      });
+      bar.appendChild(btn);
+    });
+    logo.after(bar);
+    document.body.classList.add('plex-topnav');   // activates the sidebar-hiding CSS
+  }
+
+  // Turn the search box into an icon that expands rightward over the pins.
+  if (!search.classList.contains('plex-search-collapsible') && logo.offsetWidth) {
+    leftSection.style.position = 'relative';
+    leftSection.style.justifyContent = 'flex-start';
+    if (nav.children[1]) nav.children[1].style.paddingRight = '32px';   // keep the profile icon off the edge
+    search.style.left = `${logo.offsetLeft + logo.offsetWidth + 8}px`;
+    search.style.setProperty('--plex-search-width', `${NAV_SEARCH_WIDTH}px`);
+    search.classList.add('plex-search-collapsible');
+  }
+  const input = search.querySelector('input');
+  if (input && !input.dataset.plexNavWired) {
+    input.dataset.plexNavWired = '1';
+    const bar = document.getElementById('plex-pinned-topbar');
+    const open  = () => { search.classList.add('plex-search-open'); if (bar) bar.classList.add('plex-dim'); };
+    const close = () => { if (input.value) return; search.classList.remove('plex-search-open'); if (bar) bar.classList.remove('plex-dim'); };
+    input.addEventListener('focus', open);
+    input.addEventListener('blur', () => setTimeout(close, 200));
+    search.addEventListener('click', () => input.focus());
+    close();
+  }
+}
+
 function init() {
   observer.observe(document.documentElement, OBSERVER_CONFIG);
   injectSkeleton();
@@ -398,6 +477,7 @@ if (document.readyState === 'loading') {
 
 function isHomePage() {
   const h = location.hash;
+  if (h.includes('/search')) return false;   // search view is not home — leave it fully untouched
   return !h.includes('/server/') && !h.includes('/media/');
 }
 
@@ -663,12 +743,21 @@ function shiftHub(hub, offset) {
 function pushHubsDown() {
   if (!heroEl || !heroEl.isConnected) return;
   const offset = heroOuterHeight();
-  document.querySelectorAll('[class*="VirtualHubScroller-hub"]:not([data-plex-hero-shifted])').forEach(hub => {
+  document.querySelectorAll('[class*="VirtualHubScroller-hub"]:not([data-plex-hero-shifted]):not([data-plex-hero-flow])').forEach(hub => {
+    // Most Plex builds lay hubs out in normal document flow (position: static/relative),
+    // so the relatively-positioned hero already displaces them — nothing to shift.
+    // Only builds that absolutely-position hubs (inline `top`) need a manual offset.
+    if (getComputedStyle(hub).position !== 'absolute') {
+      hub.dataset.plexHeroFlow = '1';   // normal flow — skip permanently (cheap on later passes)
+      return;
+    }
     const t = parsePx(hub.getAttribute('style') || '', 'top');
     if (t !== null) {
       shiftHub(hub, offset);
-    } else {
-      // top not set yet — watch for Plex to assign it, then push
+    } else if (!hub.dataset.plexHeroWatching) {
+      // top not set yet — watch for Plex to assign it, then push.
+      // Guard against attaching duplicate observers on repeat pushHubsDown() calls.
+      hub.dataset.plexHeroWatching = '1';
       new MutationObserver((_, obs) => {
         if (hub.dataset.plexHeroShifted) { obs.disconnect(); return; }
         const t2 = parsePx(hub.getAttribute('style') || '', 'top');

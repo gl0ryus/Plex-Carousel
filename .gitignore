@@ -1,0 +1,15 @@
+# Chrome-extension variant — not published in this repo (userscript only)
+manifest.json
+content.js
+content.css
+icons/
+
+# Dev / debug scratch
+debug-*.js
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
