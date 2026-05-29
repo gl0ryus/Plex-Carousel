@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.2.3
+// @version      3.2.4
 // @description  16:9 backdrop cards, a Recently Added hero carousel, and a streamlined top bar (pinned libraries + collapsible search) for Plex Web
 // @author       gl0ryus
 // @license      MIT
@@ -20,14 +20,14 @@ const PORTRAIT_MIN    = 1.15;    // portrait aspect ratio lower bound (h/w)
 const PORTRAIT_MAX    = 1.90;    // portrait aspect ratio upper bound (h/w)
 const CARD_MAX_WIDTH  = 800;     // px — wider elements are treated as row containers
 
-const HERO_VIEWPORT_RESERVE = 300; // px reserved at the bottom for the first hub row (header + cards)
+const HERO_VIEWPORT_RESERVE = 300; // px reserved at the bottom for the first hub row
 
 const HERO_INTERVAL_MS            = 6000;  // ms between carousel auto-advances
 const HERO_DEBOUNCE_MS            = 400;   // ms debounce before carousel init attempt
 const HERO_SLIDE_LIMIT            = 10;    // max slides shown in carousel
 const HERO_INTERSECTION_THRESHOLD = 0.1;  // carousel pauses when less than this fraction is visible
 const HERO_AMBIENT_OPACITY        = 0.55; // in-carousel local ambient glow opacity
-const AMBIENT_OPACITY             = 0.35; // full-page background blur opacity
+const AMBIENT_OPACITY             = 0.6;  // full-page background blur opacity (replaces Plex's flat backdrop on home)
 
 const CAROUSEL_CONTENT    = 'shows'; // 'shows' | 'movies' | 'both'
 
@@ -124,6 +124,11 @@ html { background: #111 !important; }
 body, #plex { background: transparent !important; }
 .dark-scrollbar { background: transparent !important; }
 [class*="FullPage-container"] { background: transparent !important; }
+body.plex-topnav [class*="NavBar-container"] {   /* floating dark pill nav over the ambient blur */
+  background: rgba(0,0,0,0.55) !important; border-radius: 16px !important; margin: 10px 14px !important;
+  border: 1px solid rgba(255,255,255,0.06) !important; box-shadow: 0 8px 26px rgba(0,0,0,0.5) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(1.2) !important; backdrop-filter: blur(16px) saturate(1.2) !important;
+}
 html body [class*="PageHeader-pageHeader"] { display: none !important; }
 [class*="MetadataPosterCardBadge-badge"], [class*="MetadataPosterCardBadge-topRightBadge"] { display: none !important; }
 [class*="MetadataPosterCardTitle-centeredSingleLineTitle"] {
@@ -187,6 +192,12 @@ img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: ce
 .plex-search-collapsible > div:first-child { width: 100% !important; }
 body.plex-topnav [class*="SourceSidebar-collapsedSidebar"] { display: none !important; }
 body.plex-topnav [class*="SourceSidebar-sidebarUnderlay"] { width: 0 !important; min-width: 0 !important; overflow: hidden !important; }
+/* ── Immersive home: carousel rests below the nav; content scrolls behind the frosted nav; ambient blur replaces Plex's flat backdrop ── */
+body.plex-home [class*="FullPageBackground-backgroundContainer"] { background: transparent !important; }
+body.plex-home [class*="FullPageBackground"] canvas { opacity: 0 !important; }
+body.plex-home [class*="Page-pageScroller"] { height: 100vh !important; }
+body.plex-home .plex-hero-wrapper { margin-top: 68px !important; }   /* carousel sits below the nav at rest */
+body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5) !important; }
 `);
 
 (function () {
@@ -355,6 +366,7 @@ function scanTree(root) {
   if (hadPending) scheduleRetry();
   hideHomeBar();
   setupTopNav();
+  applyImmersiveHome();
   maybeInitCarousel();
 }
 
@@ -388,6 +400,7 @@ let heroInitInProgress = false;
 let skeletonEl         = null;
 let skeletonTimer      = null;
 let globalAmbientEl    = null;
+let immersiveHeaderEl  = null;
 
 function hideHomeBar() {
   const bar = document.querySelector('[class*="PageHeader-pageHeader"]');
@@ -453,10 +466,41 @@ function setupTopNav() {
   }
 }
 
+// Immersive home only: float Plex's header out of flow so content scrolls behind the nav (frosted), not clipped below it.
+// Scoped via the `plex-home` body class; reverted on other pages so they keep Plex's normal layout.
+function applyImmersiveHome() {
+  if (!ENABLE_TOP_NAV) return;
+  const home = isHomePage();
+  document.body.classList.toggle('plex-home', home);
+  if (!immersiveHeaderEl || !immersiveHeaderEl.isConnected) {
+    const nav = document.querySelector('[class*="NavBar-container"]');
+    if (!nav) return;
+    let h = nav.parentElement;
+    for (let i = 0; i < 5 && h; i++) {
+      const r = h.getBoundingClientRect();
+      if (Math.round(r.top) === 0 && r.height >= 56 && r.height <= 92) { immersiveHeaderEl = h; break; }
+      h = h.parentElement;
+    }
+  }
+  const header = immersiveHeaderEl;
+  if (!header) return;
+  if (home === (header.style.position === 'absolute')) return;   // already in the desired state
+  if (home) {
+    header.style.setProperty('position', 'absolute', 'important');
+    header.style.setProperty('top', '0', 'important');
+    header.style.setProperty('left', '0', 'important');
+    header.style.setProperty('right', '0', 'important');
+    header.style.setProperty('z-index', '900', 'important');
+  } else {
+    ['position', 'top', 'left', 'right', 'zIndex'].forEach(p => { header.style[p] = ''; });
+  }
+}
+
 function init() {
   observer.observe(document.documentElement, OBSERVER_CONFIG);
   injectSkeleton();
   scanTree(document.documentElement);
+  applyImmersiveHome();
   window.addEventListener('hashchange', () => {
     if (!isHomePage()) {
       removeSkeleton();
@@ -466,6 +510,7 @@ function init() {
       injectSkeleton();
       if (globalAmbientEl) globalAmbientEl.style.opacity = AMBIENT_OPACITY;
     }
+    applyImmersiveHome();
   });
 }
 
