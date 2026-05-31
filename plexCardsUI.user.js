@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.2.6
-// @description  16:9 backdrop cards, a Recently Added hero carousel, and a streamlined top bar (pinned libraries + collapsible search) for Plex Web
+// @version      3.4.5
+// @description  Cinematic hero carousel (logo art, dynamic color, autoplay trailers), 16:9 backdrop cards, and a streamlined top bar for Plex Web
 // @author       gl0ryus
 // @license      MIT
 // @match        https://app.plex.tv/*
@@ -37,6 +37,10 @@ const SUMMARY_MAX_LENGTH  = 220;  // max characters shown in carousel item summa
 
 const ENABLE_TOP_NAV       = true; // move pinned libraries into the top bar + collapsible search icon
 const NAV_SEARCH_WIDTH     = 480;  // px width of the search box when expanded
+const ENABLE_DYNAMIC_ACCENT = true; // tint hero accents with each slide's dominant artwork color (vs fixed Plex gold)
+const ENABLE_HERO_TRAILERS  = true; // autoplay a muted trailer in the hero after a short dwell, when the item has one
+const HERO_TRAILER_DELAY_MS = 1200; // ms of hover before the trailer begins
+const ENABLE_ONLINE_TRAILERS = true; // if no local trailer file exists, pull one from Plex's online trailer service
 // ── END CONFIG ───────────────────────────────────────────────────────────────
 
 GM_addStyle(`
@@ -82,6 +86,8 @@ GM_addStyle(`
 .plex-hero-slide { position: absolute; inset: 0; opacity: 0; transition: opacity 0.7s ease; pointer-events: none; }
 .plex-hero-slide.active { opacity: 1; pointer-events: auto; }
 .plex-hero-bg { position: absolute; inset: 0; background-size: cover; background-position: center 25%; }
+.plex-hero-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border: none; opacity: 0; transition: opacity 0.6s ease; pointer-events: none; }
+.plex-hero-video.plex-show { opacity: 1; }
 .plex-hero-scrim {
   position: absolute; inset: 0;
   background: linear-gradient(to right, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.55) 40%, rgba(0,0,0,0.1) 70%, transparent 100%),
@@ -90,8 +96,11 @@ GM_addStyle(`
 .plex-hero-title-block { position: absolute; top: 24px; left: 28px; right: 48%; }
 .plex-hero-bottom-block { position: absolute; bottom: 24px; left: 28px; right: 48%; }
 .plex-hero-show { font-size: 32px; font-weight: 900; color: #fff; line-height: 1.15; margin-bottom: 0; text-shadow: 0 2px 10px rgba(0,0,0,0.7); }
+.plex-hero-logo { max-width: min(100%, 460px) !important; max-height: 100px !important; width: auto !important; height: auto !important; object-fit: contain; object-position: left top; display: block; opacity: 0; transition: opacity 0.3s ease; filter: drop-shadow(0 3px 14px rgba(0,0,0,0.85)) drop-shadow(0 0 2px rgba(0,0,0,0.55)); }
+.plex-hero-logo.plex-loaded { opacity: 1; }
 .plex-hero-ep { font-size: 17px; font-weight: 600; color: rgba(255,255,255,0.92); margin-bottom: 4px; text-shadow: 0 1px 5px rgba(0,0,0,0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.plex-hero-meta { font-size: 13px; font-weight: 700; color: #E5A00D; letter-spacing: 0.05em; margin-bottom: 10px; text-shadow: 0 1px 4px rgba(0,0,0,0.7); }
+:root { --plex-accent: #E5A00D; }   /* dynamic per-slide accent — set from the hero artwork's dominant color */
+.plex-hero-meta { font-size: 13px; font-weight: 700; color: var(--plex-accent, #E5A00D); letter-spacing: 0.05em; margin-bottom: 10px; text-shadow: 0 1px 4px rgba(0,0,0,0.7); transition: color 0.5s ease; }
 .plex-hero-summary { font-size: 13px; line-height: 1.55; color: rgba(255,255,255,0.60); text-shadow: 0 1px 3px rgba(0,0,0,0.7); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .plex-hero-slide:not([data-item-type="episode"]) .plex-hero-ep { font-size: 22px; font-weight: 700; white-space: normal; }
 .plex-hero-slide:not([data-item-type="episode"]) .plex-hero-meta { font-size: 15px; }
@@ -110,9 +119,9 @@ GM_addStyle(`
 .plex-hero-next { right: 12px; }
 .plex-hero-dots { position: absolute; bottom: 14px; right: 18px; display: flex; gap: 5px; z-index: 10; }
 .plex-hero-dot { width: 7px; height: 7px; border-radius: 50%; border: none; background: rgba(255,255,255,0.3); cursor: pointer; padding: 0; transition: background 0.25s, transform 0.25s; }
-.plex-hero-dot.active { background: #E5A00D; transform: scale(1.3); }
+.plex-hero-dot.active { background: var(--plex-accent, #E5A00D); transform: scale(1.3); }
 .plex-hero-progress { position: absolute; bottom: 0; left: 0; right: 0; height: 3px; background: rgba(255,255,255,0.12); z-index: 10; }
-.plex-hero-bar { height: 100%; width: 0%; background: #E5A00D; }
+.plex-hero-bar { height: 100%; width: 0%; background: var(--plex-accent, #E5A00D); }
 #plex-ambient-global {
   position: fixed; inset: 0;
   background-size: cover; background-position: center 25%;
@@ -181,7 +190,7 @@ img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: ce
   white-space: nowrap; transition: color 0.15s ease;
 }
 .plex-pin:hover { color: #fff; }
-.plex-pin.active { color: #E5A00D; }
+.plex-pin.active { color: #E5A00D; }   /* nav highlight stays gold — decoupled from the rotating hero accent */
 #plex-pinned-topbar.plex-dim { opacity: 0.12; pointer-events: none; }
 .plex-search-collapsible {
   position: absolute !important; top: 50%; transform: translateY(-50%);
@@ -197,7 +206,7 @@ body.plex-home [class*="FullPageBackground-backgroundContainer"] { background: t
 body.plex-home [class*="FullPageBackground"] canvas { display: none !important; }
 body.plex-home [class*="Page-pageScroller"] { height: 100vh !important; }
 body.plex-home .plex-hero-wrapper { margin-top: 68px !important; }   /* carousel sits below the nav at rest */
-body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5) !important; }
+body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5), 0 0 55px -12px var(--plex-accent, #E5A00D) !important; }   /* smaller glow, no transition — cheaper repaint on each advance */
 /* The header float pulls the expanded library drawer up under the nav, so pad its content down to clear the floating pill. */
 body.plex-home [class*="SourceSidebarContent-expandedSidebarContent"] { padding-top: 68px !important; }
 `);
@@ -410,6 +419,7 @@ let heroTimerId        = null;
 let heroSlide          = 0;
 let heroDebounce       = null;
 let heroEl             = null;
+let heroDispose        = null;   // tears down the current hero's observer/timers/listeners before a rebuild
 let heroInitInProgress = false;
 let skeletonEl         = null;
 let skeletonTimer      = null;
@@ -632,6 +642,109 @@ function plexArtUrl({ base, token }, path, w = 1280, h = 720) {
   return `${base}/photo/:/transcode?width=${w}&height=${h}&minSize=1&url=${encodeURIComponent(path)}&X-Plex-Token=${token}`;
 }
 
+// Direct image URL (no transcode) — keeps the PNG alpha channel intact for clearLogo art,
+// which the JPEG transcoder would otherwise flatten to a black box.
+function plexImageUrl({ base, token }, path) {
+  return `${base}${path}${path.includes('?') ? '&' : '?'}X-Plex-Token=${token}`;
+}
+
+// ── Dynamic accent: pull one vivid dominant color out of the hero artwork ──────
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h, s, l = (mx + mn) / 2;
+  if (mx === mn) { h = s = 0; }
+  else {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6;
+  }
+  return [h, s, l];
+}
+function hslToRgb(h, s, l) {
+  const f = (p, q, t) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q - p) * 6 * t;
+    if (t < 1/2) return q;
+    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+    return p;
+  };
+  let r, g, b;
+  if (s === 0) { r = g = b = l; }
+  else {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = f(p, q, h + 1/3); g = f(p, q, h); b = f(p, q, h - 1/3);
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+// Bucket the saturated, mid-bright pixels by hue, take the heaviest bucket, force it vivid.
+// Returns null when the image has no usable color (all grey/dark) so callers fall back to gold.
+function extractVibrant(data) {
+  const buckets = {};
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    const v = mx / 255, sat = mx === 0 ? 0 : (mx - mn) / mx;
+    if (v < 0.2 || v > 0.95 || sat < 0.35) continue;   // skip too dark, blown-out, or greyish
+    const hb = Math.round(rgbToHsl(r, g, b)[0] * 12) % 12;
+    const w = sat * v;
+    const bk = buckets[hb] || (buckets[hb] = { r: 0, g: 0, b: 0, w: 0 });
+    bk.r += r * w; bk.g += g * w; bk.b += b * w; bk.w += w;
+  }
+  let best = null, bestW = -1;
+  for (const k in buckets) if (buckets[k].w > bestW) { bestW = buckets[k].w; best = buckets[k]; }
+  if (!best) return null;
+  const [h, s, l] = rgbToHsl(best.r / best.w, best.g / best.w, best.b / best.w);
+  return hslToRgb(h, Math.min(1, Math.max(0.62, s)), Math.min(0.62, Math.max(0.5, l)));
+}
+function setAccent(rgb) {
+  document.documentElement.style.setProperty('--plex-accent', rgb ? `rgb(${rgb[0]},${rgb[1]},${rgb[2]})` : '#E5A00D');
+}
+
+const PLEX_PROVIDER = 'https://metadata.provider.plex.tv';   // Plex's online metadata — serves direct mp4 trailer URLs
+
+// Find a browser-playable trailer for an item: a local extra first, then Plex's online trailer. null if none.
+async function fetchTrailer(info, item) {
+  const key = item.grandparentRatingKey || item.parentRatingKey || item.ratingKey;
+  if (!key) return null;
+  try {
+    const r = await fetch(`${info.base}/library/metadata/${key}?includeExtras=1&X-Plex-Token=${info.token}`, { headers: { Accept: 'application/json' } });
+    if (!r.ok) return null;
+    const m0 = (await r.json()).MediaContainer?.Metadata?.[0];
+    if (!m0) return null;
+
+    // 1) Local trailer file on the server — direct play, no external dependency.
+    const local = ((m0.Extras && m0.Extras.Metadata) || []).find(e => e.subtype === 'trailer');
+    if (local) {
+      const media = local.Media && local.Media[0];
+      const part  = media && media.Part && media.Part[0];
+      const cont   = (media && media.container  || '').toLowerCase();
+      const vcodec = (media && media.videoCodec || '').toLowerCase();
+      if (part && part.key && /^(mp4|m4v|mov|webm)$/.test(cont) && !/hevc|h265|mpeg4|vc1|wmv/.test(vcodec)) {
+        return plexImageUrl(info, part.key);
+      }
+    }
+
+    // 2) Online fallback — Plex's provider returns a direct-play mp4 trailer URL for most recognized titles.
+    if (ENABLE_ONLINE_TRAILERS) {
+      const plexId = (m0.guid || '').startsWith('plex://') ? m0.guid.split('/').pop() : null;
+      if (plexId) {
+        const pr = await fetch(`${PLEX_PROVIDER}/library/metadata/${plexId}/extras?X-Plex-Token=${info.token}&X-Plex-Product=Plex%20Web&X-Plex-Client-Identifier=plexcardsui`, { headers: { Accept: 'application/json' } });
+        if (pr.ok) {
+          const online = ((await pr.json()).MediaContainer?.Metadata || []).find(e => e.subtype === 'trailer');
+          const url = online && online.Media && online.Media[0] && online.Media[0].url;
+          if (url && /^https?:\/\//.test(url)) return url;   // direct mp4 from the trailer CDN
+        }
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
 function buildHero(items, info, machineIdentifier) {
   const wrapper = document.createElement('div');
   wrapper.id = 'plex-hero';
@@ -678,6 +791,13 @@ function buildHero(items, info, machineIdentifier) {
       ? esc(rawSummary.slice(0, SUMMARY_MAX_LENGTH) + (rawSummary.length > SUMMARY_MAX_LENGTH ? '…' : ''))
       : '';
     const bg = plexArtUrl(info, item.art);
+    // Stylized show/movie logo art (Netflix/Disney+ billboard look); plain text title if none exists.
+    const logoPath = Array.isArray(item.Image)
+      ? (item.Image.find(im => im.type === 'clearLogo') || {}).url
+      : null;
+    const titleInner = logoPath
+      ? `<img class="plex-hero-logo" src="${esc(plexImageUrl(info, logoPath))}" alt="${esc(showTitle)}">`
+      : `<div class="plex-hero-show">${esc(showTitle)}</div>`;
     const slide = document.createElement('div');
     slide.className = `plex-hero-slide${i === 0 ? ' active' : ''}`;
     slide.dataset.i = i;
@@ -685,13 +805,28 @@ function buildHero(items, info, machineIdentifier) {
     slide.innerHTML = `
       <div class="plex-hero-bg" style="background-image:url('${bg}')"></div>
       <div class="plex-hero-scrim"></div>
-      <div class="plex-hero-title-block"><div class="plex-hero-show">${esc(showTitle)}</div></div>
+      <div class="plex-hero-title-block">${titleInner}</div>
       <div class="plex-hero-bottom-block">
         ${subtitle ? `<div class="plex-hero-ep">${esc(subtitle)}</div>` : ''}
         ${meta     ? `<div class="plex-hero-meta">${esc(meta)}</div>`     : ''}
         ${summary  ? `<div class="plex-hero-summary">${summary}</div>`    : ''}
       </div>`;
     slide.style.cursor = 'pointer';
+    const logoImg = slide.querySelector('.plex-hero-logo');
+    if (logoImg) {
+      const reveal = () => logoImg.classList.add('plex-loaded');   // fade in once decoded — avoids the empty-then-pop
+      if (logoImg.complete && logoImg.naturalWidth > 0) reveal();
+      else logoImg.addEventListener('load', reveal, { once: true });
+      logoImg.addEventListener('error', () => {                    // missing/broken logo → fall back to the text title
+        const block = logoImg.closest('.plex-hero-title-block');
+        if (!block) return;
+        block.textContent = '';
+        const t = document.createElement('div');
+        t.className = 'plex-hero-show';
+        t.textContent = showTitle || '';   // '' (not "undefined") when there is no title
+        block.appendChild(t);
+      }, { once: true });
+    }
     slide.addEventListener('click', e => {
       if (e.target.closest('.plex-hero-btn, .plex-hero-dot')) return;
       const key = `/library/metadata/${item.ratingKey}`;
@@ -727,6 +862,71 @@ function buildHero(items, info, machineIdentifier) {
   hero.appendChild(prog);
 
   const total = items.length;
+  heroSlide = 0;   // a fresh hero always opens on slide 0 (DOM marks i===0 active) — keep the shared index in sync
+
+  // Recolor the UI accent to match the active slide's artwork (computed once per item, then cached).
+  function applyAccent(item) {
+    if (!ENABLE_DYNAMIC_ACCENT || !item || !item.art) return;
+    if (item._accent !== undefined) { setAccent(item._accent); return; }   // already computed
+    const im = new Image();
+    im.crossOrigin = 'anonymous';
+    im.onload = () => {
+      try {
+        const c = document.createElement('canvas'); c.width = 64; c.height = 36;
+        const cx = c.getContext('2d'); cx.drawImage(im, 0, 0, 64, 36);
+        const col = extractVibrant(cx.getImageData(0, 0, 64, 36).data);
+        item._accent = col;                              // success → cache (a color, or a deterministic null)
+        if (items[heroSlide] === item) setAccent(col);   // apply only if still the active slide
+      } catch {
+        if (items[heroSlide] === item) setAccent(null);  // CORS/canvas error → gold, but don't cache (allow retry)
+      }
+    };
+    im.onerror = () => { if (items[heroSlide] === item) setAccent(null); };   // load failed → gold, don't cache (retry later)
+    im.src = plexArtUrl(info, item.art, 64, 36);       // tiny + CORS-clean (distinct URL from the bg)
+  }
+
+  // ── Muted autoplay trailer: fades in over the still after a short dwell, fades back when it ends/changes ──
+  let heroVideo = null, trailerTimer = null, heroInView = true, hovering = false;
+
+  function clearTrailer() {
+    if (trailerTimer) { clearTimeout(trailerTimer); trailerTimer = null; }
+    const v = heroVideo;
+    heroVideo = null;
+    if (v) {
+      v.classList.remove('plex-show');                 // fade out
+      try { v.pause(); v.removeAttribute('src'); v.load(); } catch {}   // stop the download immediately
+      setTimeout(() => { try { v.remove(); } catch {} }, 650);          // remove the element after the fade
+    }
+  }
+
+  function startTrailer(slideEl, url) {
+    const v = document.createElement('video');
+    v.className = 'plex-hero-video';
+    v.muted = true; v.defaultMuted = true; v.playsInline = true;
+    v.setAttribute('playsinline', ''); v.preload = 'metadata'; v.src = url;   // don't over-buffer a clip shown for seconds
+    const bg = slideEl.querySelector('.plex-hero-bg');
+    slideEl.insertBefore(v, bg ? bg.nextSibling : slideEl.firstChild);   // above the still, below scrim + text
+    heroVideo = v;
+    v.addEventListener('playing', () => v.classList.add('plex-show'), { once: true });
+    v.addEventListener('ended', clearTrailer, { once: true });
+    v.addEventListener('error', clearTrailer, { once: true });
+    const p = v.play();
+    if (p && p.catch) p.catch(() => clearTrailer());   // autoplay blocked → stay on the still
+  }
+
+  function scheduleTrailer() {
+    if (!ENABLE_HERO_TRAILERS) return;
+    if (trailerTimer) { clearTimeout(trailerTimer); trailerTimer = null; }
+    const idx = heroSlide, item = items[idx];
+    if (!item) return;
+    trailerTimer = setTimeout(async () => {
+      trailerTimer = null;
+      if (item._trailer === undefined) item._trailer = await fetchTrailer(info, item);   // resolve once, cache
+      if (heroSlide !== idx || document.hidden || !heroInView || !hovering || !item._trailer) return;   // only while hovering this slide, in view
+      const slideEl = hero.querySelectorAll('.plex-hero-slide')[idx];
+      if (slideEl) startTrailer(slideEl, item._trailer);
+    }, HERO_TRAILER_DELAY_MS);
+  }
 
   function resetBar() {
     bar.style.transition = 'none';
@@ -741,6 +941,7 @@ function buildHero(items, info, machineIdentifier) {
     heroSlide = ((n % total) + total) % total;
     hero.querySelectorAll('.plex-hero-slide').forEach((s, i) => s.classList.toggle('active', i === heroSlide));
     hero.querySelectorAll('.plex-hero-dot').forEach((d, i)   => d.classList.toggle('active', i === heroSlide));
+    clearTrailer();
     ambient.style.opacity = '0';
     if (globalAmbientEl) globalAmbientEl.style.opacity = '0';
     setTimeout(() => {
@@ -752,6 +953,8 @@ function buildHero(items, info, machineIdentifier) {
         globalAmbientEl.style.opacity = AMBIENT_OPACITY;
       }
     }, 350);
+    applyAccent(items[heroSlide]);
+    if (hovering) scheduleTrailer();   // trailers play on hover, not during idle auto-advance
     resetBar();
   }
 
@@ -770,14 +973,28 @@ function buildHero(items, info, machineIdentifier) {
   dotsWrap.querySelectorAll('.plex-hero-dot').forEach(d => {
     d.addEventListener('click', () => { goTo(+d.dataset.i); startAuto(); });
   });
-  hero.addEventListener('mouseenter', stopAuto);
-  hero.addEventListener('mouseleave', startAuto);
+  hero.addEventListener('mouseenter', () => { hovering = true;  stopAuto();  scheduleTrailer(); });
+  hero.addEventListener('mouseleave', () => { hovering = false; startAuto(); clearTrailer();    });
 
-  new IntersectionObserver(entries => {
-    entries[0].isIntersecting ? startAuto() : stopAuto();
-  }, { threshold: HERO_INTERSECTION_THRESHOLD }).observe(hero);
+  function onVisibility() { if (document.hidden) clearTrailer(); }   // stop a playing trailer when the tab is backgrounded
+  document.addEventListener('visibilitychange', onVisibility);
+
+  const io = new IntersectionObserver(entries => {
+    heroInView = entries[0].isIntersecting;
+    if (heroInView) { startAuto(); }
+    else { stopAuto(); clearTrailer(); hovering = false; }
+  }, { threshold: HERO_INTERSECTION_THRESHOLD });
+  io.observe(hero);
+
+  heroDispose = () => {                 // dispose this instance before a rebuild (no stale observers/timers/video)
+    io.disconnect();
+    document.removeEventListener('visibilitychange', onVisibility);
+    stopAuto();
+    clearTrailer();
+  };
 
   startAuto();
+  applyAccent(items[heroSlide]);   // set the accent for the first slide
   wrapper.appendChild(hero);
   return wrapper;
 }
@@ -842,6 +1059,7 @@ async function initCarousel() {
   if (heroEl && heroEl.isConnected)   { heroInitInProgress = false; return; }
   const firstHub = findFirstHub();
   if (!firstHub)                       { heroInitInProgress = false; return; }
+  if (heroDispose) { heroDispose(); heroDispose = null; }   // tear down the previous hero before replacing it
   heroEl = buildHero(items, info, machineIdentifier);
   firstHub.parentElement.insertBefore(heroEl, firstHub);
   heroInitInProgress = false;
