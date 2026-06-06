@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.4.5
+// @version      3.4.6
 // @description  Cinematic hero carousel (logo art, dynamic color, autoplay trailers), 16:9 backdrop cards, and a streamlined top bar for Plex Web
 // @author       gl0ryus
 // @license      MIT
@@ -43,7 +43,13 @@ const HERO_TRAILER_DELAY_MS = 1200; // ms of hover before the trailer begins
 const ENABLE_ONLINE_TRAILERS = true; // if no local trailer file exists, pull one from Plex's online trailer service
 // ── END CONFIG ───────────────────────────────────────────────────────────────
 
-GM_addStyle(`
+// Routes the home skin must not touch. Plex is a single-page app, so Tampermonkey's @exclude can't
+// catch these in-app navigations — we intercept the route below and switch the page skin off instead.
+const EXCLUDE_ROUTE_RE = /[#\/](settings|media|server)(?=[\/?#]|$)/i;
+
+// Page skin — hero carousel, 16:9 cards, dark backgrounds, immersive home.
+// Captured so it can be switched off on excluded routes (settings / media / server).
+const PLEX_PAGE_STYLE = GM_addStyle(`
 .plex-loading-skeleton {
   position: fixed; inset: 0; overflow: hidden;
   background: #1c1c1c; z-index: 9998; opacity: 1;
@@ -181,6 +187,21 @@ img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: ce
   text-shadow: 0 0 4px rgba(0,0,0,1), 0 0 12px rgba(0,0,0,0.8), 0 0 24px rgba(0,0,0,0.4) !important;
   display: block !important; letter-spacing: 0.04em !important;
 }
+/* ── Immersive home: carousel rests below the nav; content scrolls behind the frosted nav; ambient blur replaces Plex's flat backdrop ── */
+body.plex-home [class*="FullPageBackground-backgroundContainer"] { background: transparent !important; }
+body.plex-home [class*="FullPageBackground"] canvas { display: none !important; }
+body.plex-home [class*="Page-pageScroller"] { height: 100vh !important; }
+body.plex-home .plex-hero-wrapper { margin-top: 68px !important; }   /* carousel sits below the nav at rest */
+body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5), 0 0 55px -12px var(--plex-accent, #E5A00D) !important; }   /* smaller glow, no transition — cheaper repaint on each advance */
+/* The header float pulls the expanded library drawer up under the nav, so pad its content down to clear the floating pill. */
+body.plex-home [class*="SourceSidebarContent-expandedSidebarContent"] { padding-top: 68px !important; }
+`);
+
+// Strip the page skin immediately if we loaded straight onto an excluded route (deep link).
+if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = EXCLUDE_ROUTE_RE.test(location.hash);
+
+// Top-nav skin — pinned libraries + collapsible search. Always on so navigation stays consistent across pages.
+GM_addStyle(`
 /* ── Top-nav rework: pinned libraries + collapsible search ────────────────── */
 #plex-pinned-topbar { display: flex; flex: 1 1 auto; align-items: center; justify-content: center; gap: 26px; height: 48px; transition: opacity 0.2s ease; }
 .plex-pin {
@@ -201,14 +222,6 @@ img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: ce
 .plex-search-collapsible > div:first-child { width: 100% !important; }
 body.plex-topnav [class*="SourceSidebar-collapsedSidebar"] { display: none !important; }
 body.plex-topnav [class*="SourceSidebar-sidebarUnderlay"] { width: 0 !important; min-width: 0 !important; overflow: hidden !important; }
-/* ── Immersive home: carousel rests below the nav; content scrolls behind the frosted nav; ambient blur replaces Plex's flat backdrop ── */
-body.plex-home [class*="FullPageBackground-backgroundContainer"] { background: transparent !important; }
-body.plex-home [class*="FullPageBackground"] canvas { display: none !important; }
-body.plex-home [class*="Page-pageScroller"] { height: 100vh !important; }
-body.plex-home .plex-hero-wrapper { margin-top: 68px !important; }   /* carousel sits below the nav at rest */
-body.plex-home .plex-hero { box-shadow: 0 16px 40px rgba(0,0,0,0.5), 0 0 55px -12px var(--plex-accent, #E5A00D) !important; }   /* smaller glow, no transition — cheaper repaint on each advance */
-/* The header float pulls the expanded library drawer up under the nav, so pad its content down to clear the floating pill. */
-body.plex-home [class*="SourceSidebarContent-expandedSidebarContent"] { padding-top: 68px !important; }
 `);
 
 (function () {
@@ -427,6 +440,7 @@ let globalAmbientEl    = null;
 let immersiveHeaderEl  = null;
 
 function hideHomeBar() {
+  if (!isHomePage()) return;   // only home hides its page header; settings / media / server keep theirs
   const bar = document.querySelector('[class*="PageHeader-pageHeader"]');
   if (!bar || bar.dataset.plexHidden) return;
   bar.style.setProperty('display', 'none', 'important');
@@ -520,22 +534,38 @@ function applyImmersiveHome() {
   }
 }
 
+// Keep the page skin in sync with the current route. Plex is a single-page app, so we watch in-app
+// navigation (hash + History API) and switch the home skin off on settings / media / server pages.
+function onRouteChange() {
+  if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = isExcludedPage();
+  if (isHomePage()) {
+    injectSkeleton();
+    if (globalAmbientEl) { globalAmbientEl.style.display = ''; globalAmbientEl.style.opacity = AMBIENT_OPACITY; }
+  } else {
+    removeSkeleton();
+    if (heroTimerId) { clearInterval(heroTimerId); heroTimerId = null; }
+    if (globalAmbientEl) globalAmbientEl.style.opacity = '0';
+    if (isExcludedPage()) {                       // tear the hero fully down so the excluded page is clean
+      if (heroDispose) { heroDispose(); heroDispose = null; }
+      if (heroEl) { heroEl.remove(); heroEl = null; }
+      if (globalAmbientEl) globalAmbientEl.style.display = 'none';
+    }
+  }
+  applyImmersiveHome();
+}
+
 function init() {
   observer.observe(document.documentElement, OBSERVER_CONFIG);
   injectSkeleton();
   scanTree(document.documentElement);
   runMaintenance();
-  window.addEventListener('hashchange', () => {
-    if (!isHomePage()) {
-      removeSkeleton();
-      if (globalAmbientEl) globalAmbientEl.style.opacity = '0';
-      if (heroTimerId) { clearInterval(heroTimerId); heroTimerId = null; }
-    } else {
-      injectSkeleton();
-      if (globalAmbientEl) globalAmbientEl.style.opacity = AMBIENT_OPACITY;
-    }
-    applyImmersiveHome();
+  window.addEventListener('hashchange', onRouteChange);
+  window.addEventListener('popstate', onRouteChange);
+  ['pushState', 'replaceState'].forEach(m => {   // Plex routes via the hash, but cover History API navigations too
+    const orig = history[m];
+    history[m] = function () { const r = orig.apply(this, arguments); onRouteChange(); return r; };
   });
+  onRouteChange();   // sync the initial route (handles a deep link straight onto an excluded page)
 }
 
 if (document.readyState === 'loading') {
@@ -544,10 +574,13 @@ if (document.readyState === 'loading') {
   init();
 }
 
+function isExcludedPage() {
+  return EXCLUDE_ROUTE_RE.test(location.hash);   // settings / media / server — the home skin is switched off here
+}
+
 function isHomePage() {
-  const h = location.hash;
-  if (h.includes('/search')) return false;   // search view is not home — leave it fully untouched
-  return !h.includes('/server/') && !h.includes('/media/');
+  if (location.hash.includes('/search')) return false;   // search view is not home — leave it fully untouched
+  return !isExcludedPage();
 }
 
 function injectSkeleton() {
@@ -1056,6 +1089,7 @@ async function initCarousel() {
     return;                             // leave skeleton up; timeout will clear it
   }
   if (!items || items.length < 2) { heroInitInProgress = false; return; }
+  if (!isHomePage())              { heroInitInProgress = false; return; }   // navigated to an excluded route mid-fetch
   if (heroEl && heroEl.isConnected)   { heroInitInProgress = false; return; }
   const firstHub = findFirstHub();
   if (!firstHub)                       { heroInitInProgress = false; return; }
