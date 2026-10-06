@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.4.6
+// @version      3.4.7
 // @description  Cinematic hero carousel (logo art, dynamic color, autoplay trailers), 16:9 backdrop cards, and a streamlined top bar for Plex Web
 // @author       gl0ryus
 // @license      MIT
@@ -159,7 +159,7 @@ html body [class*="PageHeader-pageHeader"] { display: none !important; }
   padding-top: 10px !important; padding-bottom: 4px !important; margin-top: 0 !important;
 }
 img[data-plex-processed="1"] { object-fit: cover !important; object-position: center center !important; width: 100% !important; height: 100% !important; }
-img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: center top !important; }
+img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: center 20% !important; opacity: 1 !important; visibility: visible !important; }   /* Plex hides the img after its own error state — force the poster back */
 [data-plex-card="1"] { border-radius: 10px !important; }
 [data-plex-role="title"] {
   position: absolute !important; top: 8px !important; left: 8px !important; right: 8px !important;
@@ -303,17 +303,6 @@ function applyFixes(cardContainers, rowContainer, newCardH) {
   }
 }
 
-function revertFixes(cardContainers, rowContainer) {
-  for (const { el, origH } of cardContainers) {
-    delete el.dataset.plexFixed;
-    el.style.setProperty('height', `${origH}px`, 'important');
-  }
-  if (rowContainer) {
-    delete rowContainer.el.dataset.plexFixed;
-    rowContainer.el.style.setProperty('height', `${rowContainer.origH}px`, 'important');
-  }
-}
-
 function overlayCardText(img) {
   const imageContainer = img.closest('[class*="MetadataPosterListItem-card"]');
   if (!imageContainer) return;
@@ -331,19 +320,21 @@ function overlayCardText(img) {
   if (spanEl)  spanEl.dataset.plexRole  = 'episode';
 }
 
-// Resize the portrait card to 16:9, overlay its text, and revert on image load error.
+// Resize the portrait card to 16:9 and overlay its text.
 function applyCardFix(img, cardContainers) {
   const cardOrigH    = cardContainers[0].origH;
   const newCardH     = Math.round(cardContainers[0].origW * TARGET_RATIO);
   const rowContainer = findRowContainer(img, cardOrigH);
   applyFixes(cardContainers, rowContainer, newCardH);
   overlayCardText(img);
-  img.addEventListener('error', () => {
-    img.dataset.plexFallback = '1';
-    delete img.dataset.plexProcessed;
-    revertFixes(cardContainers, rowContainer);
-    img.src = img.dataset.origSrc;
-  }, { once: true });
+}
+
+// No backdrop art (404) → show the original poster cropped into the 16:9 card.
+// The card keeps its 16:9 size so the row stays uniform instead of one card snapping back to portrait.
+function onBackdropError(img) {
+  if (img.dataset.plexFallback) return;
+  img.dataset.plexFallback = '1';
+  img.src = img.dataset.origSrc;
 }
 
 const pendingImages = new Set();
@@ -360,6 +351,7 @@ function processImage(img) {
   if (!backdropSrc) return;
   img.dataset.plexProcessed = '1';
   img.dataset.origSrc = src;
+  img.addEventListener('error', () => onBackdropError(img), { once: true });   // attach before the swap so no error is missed
   const cardContainers = collectPortraitContainers(img);
   if (cardContainers.length === 0) {
     pendingImages.add(img);
