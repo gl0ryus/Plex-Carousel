@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plex 16:9 Cards
 // @namespace    https://app.plex.tv
-// @version      3.4.6
+// @version      3.7.4
 // @description  Cinematic hero carousel (logo art, dynamic color, autoplay trailers), 16:9 backdrop cards, and a streamlined top bar for Plex Web
 // @author       gl0ryus
 // @license      MIT
@@ -41,11 +41,18 @@ const ENABLE_DYNAMIC_ACCENT = true; // tint hero accents with each slide's domin
 const ENABLE_HERO_TRAILERS  = true; // autoplay a muted trailer in the hero after a short dwell, when the item has one
 const HERO_TRAILER_DELAY_MS = 1200; // ms of hover before the trailer begins
 const ENABLE_ONLINE_TRAILERS = true; // if no local trailer file exists, pull one from Plex's online trailer service
+const CARD_SCALE            = 1.2;  // home row size multiplier (1 = Plex's default card size)
+const ENABLE_CARD_LOGOS     = true; // show the show/movie logo art on cards instead of the text title (text if no logo)
+const ENABLE_SCROLL_SNAP    = true; // home scroll sticks at the carousel, then loosely snaps to each row of cards
+const HERO_STICK_PX         = 280;  // px of downward wheel the carousel holds before letting go to the first row
+const ROW_SNAP_RANGE        = 140;  // px — a scroll that ends this close to a row settles onto it; farther stays put
+const HERO_SNAP_VISIBLE     = 0.25; // scrolling up: once this share of the carousel is visible, glide the rest of the way
 // ── END CONFIG ───────────────────────────────────────────────────────────────
 
-// Routes the home skin must not touch. Plex is a single-page app, so Tampermonkey's @exclude can't
-// catch these in-app navigations — we intercept the route below and switch the page skin off instead.
-const EXCLUDE_ROUTE_RE = /[#\/](settings|media|server)(?=[\/?#]|$)/i;
+// The home skin applies only on the bare root route ("", "#!/", "#!/?…"). Plex is a single-page app, so
+// Tampermonkey's @exclude can't catch in-app navigations — we watch the route and switch the skin off
+// everywhere else (settings, libraries, search, Discover, Live TV, and any route Plex adds later).
+const HOME_ROUTE_RE = /^(#!?\/?)?(\?.*)?$/;
 
 // Page skin — hero carousel, 16:9 cards, dark backgrounds, immersive home.
 // Captured so it can be switched off on excluded routes (settings / media / server).
@@ -159,8 +166,20 @@ html body [class*="PageHeader-pageHeader"] { display: none !important; }
   padding-top: 10px !important; padding-bottom: 4px !important; margin-top: 0 !important;
 }
 img[data-plex-processed="1"] { object-fit: cover !important; object-position: center center !important; width: 100% !important; height: 100% !important; }
-img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: center top !important; }
+img[data-plex-fallback="1"]  { object-fit: cover !important; object-position: center 20% !important; opacity: 1 !important; visibility: visible !important; }   /* Plex hides the img after its own error state — force the poster back */
 [data-plex-card="1"] { border-radius: 10px !important; }
+/* Bigger home rows. zoom (not transform) keeps Plex's horizontal virtualization math consistent,
+   since scrollLeft, clientWidth and the cells' inline left/width all stay in the row's own units. */
+body.plex-home [class*="VirtualHubScroller-hub-"] { zoom: ${CARD_SCALE}; }
+.plex-card-logo {
+  position: absolute !important; top: 9px; left: 9px; z-index: 2;
+  max-width: 60%; max-height: 40%; width: auto; height: auto;
+  object-fit: contain; object-position: left top; pointer-events: none;
+  opacity: 0; transition: opacity 0.25s ease;
+  filter: drop-shadow(0 2px 8px rgba(0,0,0,0.85)) drop-shadow(0 0 2px rgba(0,0,0,0.6));
+}
+[data-plex-logo="1"] > .plex-card-logo { opacity: 1; }
+[data-plex-logo="1"] > [data-plex-role="title"] { visibility: hidden !important; }   /* logo replaces the title text */
 [data-plex-role="title"] {
   position: absolute !important; top: 8px !important; left: 8px !important; right: 8px !important;
   margin: 0 !important; padding: 0 !important; background: transparent !important;
@@ -198,7 +217,7 @@ body.plex-home [class*="SourceSidebarContent-expandedSidebarContent"] { padding-
 `);
 
 // Strip the page skin immediately if we loaded straight onto an excluded route (deep link).
-if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = EXCLUDE_ROUTE_RE.test(location.hash);
+if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = !HOME_ROUTE_RE.test(location.hash);
 
 // Top-nav skin — pinned libraries + collapsible search. Always on so navigation stays consistent across pages.
 GM_addStyle(`
@@ -247,6 +266,24 @@ function buildBackdropUrl(src) {
     const w = parseInt(url.searchParams.get('width') || '0', 10);
     const h = parseInt(url.searchParams.get('height') || '0', 10);
     if (w > 0 && h > 0) url.searchParams.set('height', String(Math.round(w * TARGET_RATIO)));
+    return src.startsWith('http') ? url.toString() : `${url.pathname}${url.search}`;
+  } catch { return null; }
+}
+
+// Same transcode URL, pointed at the item's clearLogo. Transparent PNG, sized for a card.
+function buildLogoUrl(src) {
+  if (!isPlexTranscodeUrl(src)) return null;
+  try {
+    const base = src.startsWith('http') ? src : `${location.origin}${src}`;
+    const url = new URL(base);
+    const inner = url.searchParams.get('url');
+    if (!inner || !/^\/library\/metadata\/\d+\/thumb/.test(inner)) return null;
+    url.searchParams.set('url', inner.replace(/\/thumb(\/\d+)?/, '/clearLogo'));
+    url.searchParams.set('width', '320');
+    url.searchParams.set('height', '120');
+    url.searchParams.set('format', 'png');   // keep the alpha channel (the transcoder defaults to JPEG)
+    url.searchParams.delete('minSize');
+    url.searchParams.delete('upscale');
     return src.startsWith('http') ? url.toString() : `${url.pathname}${url.search}`;
   } catch { return null; }
 }
@@ -303,17 +340,6 @@ function applyFixes(cardContainers, rowContainer, newCardH) {
   }
 }
 
-function revertFixes(cardContainers, rowContainer) {
-  for (const { el, origH } of cardContainers) {
-    delete el.dataset.plexFixed;
-    el.style.setProperty('height', `${origH}px`, 'important');
-  }
-  if (rowContainer) {
-    delete rowContainer.el.dataset.plexFixed;
-    rowContainer.el.style.setProperty('height', `${rowContainer.origH}px`, 'important');
-  }
-}
-
 function overlayCardText(img) {
   const imageContainer = img.closest('[class*="MetadataPosterListItem-card"]');
   if (!imageContainer) return;
@@ -331,19 +357,75 @@ function overlayCardText(img) {
   if (spanEl)  spanEl.dataset.plexRole  = 'episode';
 }
 
-// Resize the portrait card to 16:9, overlay its text, and revert on image load error.
+// Put the item's logo over the card; the text title stays as the fallback until (and unless) it loads.
+// Plex recycles cards while scrolling, so the logo is re-pointed every time the card's img is reprocessed.
+function applyCardLogo(img) {
+  if (!ENABLE_CARD_LOGOS) return;
+  const imageContainer = img.closest('[class*="MetadataPosterListItem-card"]');
+  const wrap = imageContainer && imageContainer.parentElement;
+  if (!wrap) return;
+  const url = buildLogoUrl(img.dataset.origSrc);
+  let logo = wrap.querySelector(':scope > img.plex-card-logo');
+  if (logo && logo.dataset.plexFor === url) return;
+  delete wrap.dataset.plexLogo;   // old item's logo must not linger on the new item
+  if (!url) { if (logo) logo.remove(); return; }
+  if (!logo) {
+    logo = document.createElement('img');
+    logo.className = 'plex-card-logo';
+    logo.alt = '';
+    logo.dataset.plexLogoImg = '1';
+    logo.addEventListener('load',  () => { if (logo.getAttribute('src') === logo.dataset.plexFor) wrap.dataset.plexLogo = '1'; });
+    logo.addEventListener('error', () => { delete wrap.dataset.plexLogo; });   // no logo art → keep the text title
+    wrap.appendChild(logo);
+  }
+  logo.dataset.plexFor = url;
+  logo.setAttribute('src', url);
+}
+
+// Resize the portrait card to 16:9 and overlay its text.
 function applyCardFix(img, cardContainers) {
   const cardOrigH    = cardContainers[0].origH;
   const newCardH     = Math.round(cardContainers[0].origW * TARGET_RATIO);
   const rowContainer = findRowContainer(img, cardOrigH);
   applyFixes(cardContainers, rowContainer, newCardH);
   overlayCardText(img);
-  img.addEventListener('error', () => {
-    img.dataset.plexFallback = '1';
-    delete img.dataset.plexProcessed;
-    revertFixes(cardContainers, rowContainer);
-    img.src = img.dataset.origSrc;
-  }, { once: true });
+  applyCardLogo(img);
+}
+
+// No backdrop art (404) → show the original poster cropped into the 16:9 card.
+// The card keeps its 16:9 size so the row stays uniform instead of one card snapping back to portrait.
+// Plex's own onError (which runs before ours) unmounts the <img> and leaves the container empty,
+// so swapping src alone isn't enough: put our own poster img in the container captured up front.
+function onBackdropError(img, container) {
+  if (img.dataset.plexFallback) return;
+  img.dataset.plexFallback = '1';
+  const posterSrc = img.dataset.origSrc;
+  if (img.isConnected) setImgSrc(img, posterSrc);   // detached → nobody would see it, skip the request
+  requestAnimationFrame(() => {
+    if (img.isConnected || !container || !container.isConnected || container.querySelector('img')) return;
+    const poster = document.createElement('img');
+    poster.dataset.plexFallback = '1';
+    poster.dataset.plexInjected = '1';
+    poster.alt = '';
+    poster.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;';
+    poster.src = posterSrc;
+    container.appendChild(poster);
+  });
+}
+
+// Remember exactly what we wrote, so a later src change can be told apart as Plex reusing the img.
+function setImgSrc(img, url) {
+  img.dataset.plexSet = url;
+  img.setAttribute('src', url);
+}
+
+// Plex virtualizes hub rows: an img (or its container) can be recycled for a different item.
+// Forget our state so the new item gets its own backdrop instead of the previous item's poster.
+function resetImage(img) {
+  if (img._plexOnError) img.removeEventListener('error', img._plexOnError);
+  delete img._plexOnError;
+  pendingImages.delete(img);
+  for (const k of ['plexProcessed', 'plexFallback', 'origSrc', 'plexSet']) delete img.dataset[k];
 }
 
 const pendingImages = new Set();
@@ -351,24 +433,30 @@ let retryScheduled = false;
 let retryFrames    = 0;
 
 function processImage(img) {
+  if (img.dataset.plexInjected || img.dataset.plexLogoImg) return;
+  // A real Plex img showing up next to our injected poster means the card re-rendered → drop ours.
+  img.parentElement?.querySelectorAll(':scope > img[data-plex-injected]').forEach(p => p.remove());
   if (!isHomePage()) return;
   if (img.closest('[class*="SearchResult"]')) return;   // leave search dropdown thumbnails alone
   if (img.dataset.plexProcessed || img.dataset.plexFallback) return;
-  const src = img.src || img.getAttribute('data-src') || '';
+  const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
   if (!isPlexTranscodeUrl(src)) return;
   const backdropSrc = buildBackdropUrl(src);
   if (!backdropSrc) return;
   img.dataset.plexProcessed = '1';
   img.dataset.origSrc = src;
+  const container = img.parentElement;   // Plex detaches the img on error, so grab its container now
+  img._plexOnError = () => onBackdropError(img, container);
+  img.addEventListener('error', img._plexOnError, { once: true });   // attach before the swap so no error is missed
   const cardContainers = collectPortraitContainers(img);
-  if (cardContainers.length === 0) {
+  if (cardContainers.length > 0) applyCardFix(img, cardContainers);
+  else if (img.closest('[class*="MetadataPosterListItem-card"][data-plex-fixed]')) { overlayCardText(img); applyCardLogo(img); }   // recycled card, already 16:9
+  else {
     pendingImages.add(img);
     retryFrames = 0;   // fresh work — restart the retry budget
-  } else {
-    applyCardFix(img, cardContainers);
   }
-  if (img.src) img.src = backdropSrc;
-  else img.setAttribute('data-src', backdropSrc);
+  if (img.getAttribute('src')) setImgSrc(img, backdropSrc);
+  else { img.dataset.plexSet = backdropSrc; img.setAttribute('data-src', backdropSrc); }
 }
 
 function retryPending() {
@@ -415,9 +503,12 @@ const observer = new MutationObserver(mutations => {
         scanTree(node);
         hadNew = true;
       });
-    } else if (m.type === 'attributes' && m.target.tagName === 'IMG' &&
-               !m.target.dataset.plexProcessed && !m.target.dataset.plexFallback) {
-      processImage(m.target);
+    } else if (m.type === 'attributes' && m.target.tagName === 'IMG') {
+      const img = m.target;
+      const val = img.getAttribute(m.attributeName);
+      if (img.dataset.plexSet && val && val !== img.dataset.plexSet) resetImage(img);   // recycled for another item
+      if (img.dataset.plexProcessed || img.dataset.plexFallback) continue;
+      processImage(img);
       hadNew = true;
     }
   }
@@ -434,6 +525,7 @@ let heroDebounce       = null;
 let heroEl             = null;
 let heroDispose        = null;   // tears down the current hero's observer/timers/listeners before a rebuild
 let heroInitInProgress = false;
+let heroInitFailedAt   = 0;      // last failed init — throttles retries so every mutation doesn't refetch the API
 let skeletonEl         = null;
 let skeletonTimer      = null;
 let globalAmbientEl    = null;
@@ -471,8 +563,12 @@ function setupTopNav() {
       const btn = document.createElement('button');
       btn.className = 'plex-pin';
       btn.textContent = orig.getAttribute('aria-label') || orig.textContent.trim();
+      const label = btn.textContent;
       btn.addEventListener('click', () => {
-        orig.click();
+        // Plex can remount the sidebar; the link captured at build time would then be a dead node.
+        const live = orig.isConnected ? orig : [...document.querySelectorAll('[class*="SourceSidebarLink-sourceLink"]')]
+          .find(o => (o.getAttribute('aria-label') || o.textContent.trim()) === label);
+        if (live) live.click();
         bar.querySelectorAll('.plex-pin').forEach(p => p.classList.remove('active'));
         btn.classList.add('active');
       });
@@ -536,20 +632,138 @@ function applyImmersiveHome() {
 
 // Keep the page skin in sync with the current route. Plex is a single-page app, so we watch in-app
 // navigation (hash + History API) and switch the home skin off on settings / media / server pages.
+// ── Home scroll: the hero resists a downward pull before letting go, then rows loosely settle ──
+// Done in JS rather than CSS scroll-snap: CSS proximity leaves the snap distance to the browser, and it
+// re-snaps while the page is still loading, which could leave home opened at the first row.
+const SNAP_NAV_OFFSET  = 66;     // px — a settled row's title sits just under the floating nav
+const HERO_RESISTANCE  = 0.35;   // fraction of wheel movement the page follows while the hero holds
+const SNAP_IDLE_MS     = 140;    // pause after scrolling stops before a row settles (lets momentum finish)
+let pullAcc = 0, pullTimer = null, anim = null, settleTimer = null, releasing = 0;   // releasing: glide direction, 1 down / -1 up
+
+function rowSnapPoints(sc) {
+  const base = sc.getBoundingClientRect().top - sc.scrollTop + SNAP_NAV_OFFSET;
+  return [...document.querySelectorAll('[class*="VirtualHubScroller-hub-"]')]
+    .map(h => Math.round(h.getBoundingClientRect().top - base));
+}
+
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+
+// Eased glide (Chrome's own smooth scroll is short and abrupt). Longer distances take a little longer.
+function glideTo(sc, top, ms) {
+  cancelGlide();
+  const from = sc.scrollTop, dist = top - from;
+  if (Math.abs(dist) < 2) return;
+  const dur = ms || Math.min(900, Math.max(450, 300 + Math.abs(dist) * 0.45));
+  const t0 = performance.now();
+  const step = now => {
+    const t = Math.min(1, (now - t0) / dur);
+    sc.scrollTop = from + dist * easeOutCubic(t);
+    anim = t < 1 ? requestAnimationFrame(step) : null;
+    if (!anim) releasing = 0;
+  };
+  anim = requestAnimationFrame(step);
+}
+
+function cancelGlide() {
+  if (anim) { cancelAnimationFrame(anim); anim = null; }
+  releasing = 0;
+}
+
+// Share of the carousel visible below the nav, after the page moves up by `ahead` px (this wheel step).
+function heroVisibleShare(sc, ahead = 0) {
+  const hr = heroEl.getBoundingClientRect();
+  const top = sc.getBoundingClientRect().top + SNAP_NAV_OFFSET;
+  return Math.max(0, Math.min(hr.height, hr.bottom + ahead - top)) / hr.height;
+}
+
+function resetPull() {
+  pullAcc = 0;
+  if (pullTimer) { clearTimeout(pullTimer); pullTimer = null; }
+}
+
+function snapActive() {
+  return ENABLE_SCROLL_SNAP && isHomePage() && heroEl && heroEl.isConnected;
+}
+
+function onHomeWheel(e) {
+  if (!snapActive() || e.ctrlKey) return;
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;   // sideways scroll through a row of cards
+  const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;        // line-mode wheels report lines, not px
+  // Trackpad momentum keeps sending wheel events after a flick; during a hero glide, same-direction
+  // input rides along instead of cancelling it. Any other input takes over from a glide.
+  if (releasing && Math.sign(dy) === releasing) { e.preventDefault(); return; }
+  cancelGlide();
+  clearTimeout(settleTimer);
+  const sc = e.currentTarget;
+  const first = rowSnapPoints(sc)[0];
+  if (first === undefined) return;
+  if (dy < 0) {   // scrolling up is free until enough of the carousel shows, then it glides the rest of the way
+    resetPull();
+    if (sc.scrollTop > 4 && heroVisibleShare(sc, -dy) >= HERO_SNAP_VISIBLE) {
+      e.preventDefault();
+      glideTo(sc, 0);
+      releasing = anim ? -1 : 0;
+    }
+    return;
+  }
+  if (sc.scrollTop >= first - 4) return;   // below the hero → normal scrolling
+  e.preventDefault();
+  pullAcc += dy;
+  if (pullAcc >= HERO_STICK_PX) { resetPull(); glideTo(sc, first); releasing = anim ? 1 : 0; return; }   // pulled far enough → let go
+  sc.scrollTop += dy * HERO_RESISTANCE;   // the page gives a little, so the hold feels physical, not frozen
+  clearTimeout(pullTimer);
+  pullTimer = setTimeout(() => {          // released early → spring back to the carousel
+    resetPull();
+    if (snapActive() && sc.scrollTop < first - 4) glideTo(sc, 0, 450);
+  }, 220);
+}
+
+function settleRows(sc) {
+  if (!snapActive() || anim || pullAcc) return;
+  const pts = rowSnapPoints(sc);
+  if (!pts.length) return;
+  const st = sc.scrollTop, maxTop = sc.scrollHeight - sc.clientHeight;
+  if (st < pts[0] - 4) {   // stopped partway through the hero (scrollbar, keyboard) → same rule as scrolling up
+    if (st > 4) glideTo(sc, heroVisibleShare(sc) >= HERO_SNAP_VISIBLE ? 0 : pts[0]);
+    return;
+  }
+  const nearest = pts.reduce((a, b) => Math.abs(b - st) < Math.abs(a - st) ? b : a);
+  if (nearest <= maxTop && Math.abs(nearest - st) <= ROW_SNAP_RANGE) glideTo(sc, nearest);
+}
+
+function onHomeScrollEnd(e) {
+  if (anim) return;   // our own glide frames end in scrollend too
+  const sc = e.currentTarget;
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => settleRows(sc), SNAP_IDLE_MS);
+}
+
+// Called once the hero is in place: home always opens on the carousel, and the scroller gets wired once.
+function enableScrollSnap() {
+  if (!ENABLE_SCROLL_SNAP || !heroEl || !heroEl.isConnected) return;
+  const sc = heroEl.closest('[class*="PageContent-pageContentScroller"]');
+  if (!sc) return;
+  sc.scrollTop = 0;
+  if (sc.dataset.plexSnapWired) return;
+  sc.dataset.plexSnapWired = '1';
+  sc.addEventListener('wheel', onHomeWheel, { passive: false });   // non-passive so the hero can hold the scroll
+  sc.addEventListener('scrollend', onHomeScrollEnd);
+}
+
 function onRouteChange() {
-  if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = isExcludedPage();
+  if (PLEX_PAGE_STYLE) PLEX_PAGE_STYLE.disabled = !isHomePage();
   if (isHomePage()) {
     injectSkeleton();
     if (globalAmbientEl) { globalAmbientEl.style.display = ''; globalAmbientEl.style.opacity = AMBIENT_OPACITY; }
   } else {
+    resetPull();
+    cancelGlide();
     removeSkeleton();
     if (heroTimerId) { clearInterval(heroTimerId); heroTimerId = null; }
     if (globalAmbientEl) globalAmbientEl.style.opacity = '0';
-    if (isExcludedPage()) {                       // tear the hero fully down so the excluded page is clean
-      if (heroDispose) { heroDispose(); heroDispose = null; }
-      if (heroEl) { heroEl.remove(); heroEl = null; }
-      if (globalAmbientEl) globalAmbientEl.style.display = 'none';
-    }
+    if (heroDispose) { heroDispose(); heroDispose = null; }   // tear the hero fully down so the other page is clean
+    if (heroEl) { heroEl.remove(); heroEl = null; }
+    if (globalAmbientEl) globalAmbientEl.style.display = 'none';
   }
   applyImmersiveHome();
 }
@@ -574,13 +788,8 @@ if (document.readyState === 'loading') {
   init();
 }
 
-function isExcludedPage() {
-  return EXCLUDE_ROUTE_RE.test(location.hash);   // settings / media / server — the home skin is switched off here
-}
-
 function isHomePage() {
-  if (location.hash.includes('/search')) return false;   // search view is not home — leave it fully untouched
-  return !isExcludedPage();
+  return HOME_ROUTE_RE.test(location.hash);
 }
 
 function injectSkeleton() {
@@ -603,6 +812,12 @@ function removeSkeleton() {
   setTimeout(() => el.remove(), 550);
 }
 
+// A stalled request to an unreachable server would otherwise hang init (and block retries) for minutes.
+const FETCH_TIMEOUT_MS = 10000;
+function plexFetch(url) {
+  return fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+}
+
 function getServerInfo() {
   const img = document.querySelector('img[src*="/photo/:/transcode"][src*="X-Plex-Token"]');
   if (!img) return null;
@@ -618,7 +833,7 @@ async function fetchMachineIdentifier({ base, token }) {
   const m = location.hash.match(/\/server\/([^/?#]+)/);
   if (m) return m[1];
   try {
-    const res = await fetch(`${base}/identity?X-Plex-Token=${token}`, { headers: { Accept: 'application/json' } });
+    const res = await plexFetch(`${base}/identity?X-Plex-Token=${token}`);
     if (res.ok) return (await res.json()).MediaContainer?.machineIdentifier || '';
   } catch {}
   return '';
@@ -626,7 +841,7 @@ async function fetchMachineIdentifier({ base, token }) {
 
 async function fetchRecentItems({ base, token }) {
   const [sectionsRes, machineIdentifier] = await Promise.all([
-    fetch(`${base}/library/sections?X-Plex-Token=${token}`, { headers: { Accept: 'application/json' } }),
+    plexFetch(`${base}/library/sections?X-Plex-Token=${token}`),
     fetchMachineIdentifier({ base, token }),
   ]);
   if (!sectionsRes.ok) throw new Error(`HTTP ${sectionsRes.status}`);
@@ -638,7 +853,7 @@ async function fetchRecentItems({ base, token }) {
   if (!sectionKeys.length) throw new Error('No matching library sections');
 
   const fetches = await Promise.all(sectionKeys.map(key =>
-    fetch(`${base}/library/sections/${key}/recentlyAdded?X-Plex-Token=${token}&limit=${RECENT_ITEMS_LIMIT}`, { headers: { Accept: 'application/json' } })
+    plexFetch(`${base}/library/sections/${key}/recentlyAdded?X-Plex-Token=${token}&limit=${RECENT_ITEMS_LIMIT}`)
       .then(r => r.ok ? r.json() : {}).catch(() => ({}))
   ));
 
@@ -658,13 +873,18 @@ async function fetchRecentItems({ base, token }) {
   await Promise.all(unique.map(async item => {
     if ((item.type === 'season' || (!item.grandparentTitle && !item.summary)) && item.parentRatingKey) {
       try {
-        const r = await fetch(`${base}/library/metadata/${item.parentRatingKey}?X-Plex-Token=${token}`, { headers: { Accept: 'application/json' } });
+        const r = await plexFetch(`${base}/library/metadata/${item.parentRatingKey}?X-Plex-Token=${token}`);
         if (r.ok) item._parentSummary = (await r.json()).MediaContainer?.Metadata?.[0]?.summary || '';
       } catch {}
     }
   }));
 
   return { items: unique, machineIdentifier };
+}
+
+// JSON string syntax is a valid CSS string, so quotes/parens in a URL can't break out of url().
+function cssUrl(u) {
+  return `url(${JSON.stringify(u)})`;
 }
 
 function esc(s) {
@@ -745,7 +965,7 @@ async function fetchTrailer(info, item) {
   const key = item.grandparentRatingKey || item.parentRatingKey || item.ratingKey;
   if (!key) return null;
   try {
-    const r = await fetch(`${info.base}/library/metadata/${key}?includeExtras=1&X-Plex-Token=${info.token}`, { headers: { Accept: 'application/json' } });
+    const r = await plexFetch(`${info.base}/library/metadata/${key}?includeExtras=1&X-Plex-Token=${info.token}`);
     if (!r.ok) return null;
     const m0 = (await r.json()).MediaContainer?.Metadata?.[0];
     if (!m0) return null;
@@ -766,7 +986,7 @@ async function fetchTrailer(info, item) {
     if (ENABLE_ONLINE_TRAILERS) {
       const plexId = (m0.guid || '').startsWith('plex://') ? m0.guid.split('/').pop() : null;
       if (plexId) {
-        const pr = await fetch(`${PLEX_PROVIDER}/library/metadata/${plexId}/extras?X-Plex-Token=${info.token}&X-Plex-Product=Plex%20Web&X-Plex-Client-Identifier=plexcardsui`, { headers: { Accept: 'application/json' } });
+        const pr = await plexFetch(`${PLEX_PROVIDER}/library/metadata/${plexId}/extras?X-Plex-Token=${info.token}&X-Plex-Product=Plex%20Web&X-Plex-Client-Identifier=plexcardsui`);
         if (pr.ok) {
           const online = ((await pr.json()).MediaContainer?.Metadata || []).find(e => e.subtype === 'trailer');
           const url = online && online.Media && online.Media[0] && online.Media[0].url;
@@ -785,7 +1005,7 @@ function buildHero(items, info, machineIdentifier) {
 
   const ambient = document.createElement('div');
   ambient.className = 'plex-hero-ambient';
-  ambient.style.backgroundImage = `url('${plexArtUrl(info, items[0].art)}')`;
+  ambient.style.backgroundImage = cssUrl(plexArtUrl(info, items[0].art));
   wrapper.appendChild(ambient);
 
   if (!globalAmbientEl) {
@@ -794,8 +1014,9 @@ function buildHero(items, info, machineIdentifier) {
     const plexEl = document.getElementById('plex');
     document.body.insertBefore(globalAmbientEl, plexEl || document.body.firstChild);
   }
-  globalAmbientEl.style.backgroundImage = `url('${plexArtUrl(info, items[0].art)}')`;
-  requestAnimationFrame(() => { if (globalAmbientEl) globalAmbientEl.style.opacity = AMBIENT_OPACITY; });
+  globalAmbientEl.style.backgroundImage = cssUrl(plexArtUrl(info, items[0].art));
+  let disposed = false;   // set by heroDispose — late timers/fetches from this instance must not touch the page
+  requestAnimationFrame(() => { if (!disposed && globalAmbientEl) globalAmbientEl.style.opacity = AMBIENT_OPACITY; });
 
   const hero = document.createElement('div');
   hero.className = 'plex-hero';
@@ -836,7 +1057,7 @@ function buildHero(items, info, machineIdentifier) {
     slide.dataset.i = i;
     slide.dataset.itemType = item.type || 'unknown';
     slide.innerHTML = `
-      <div class="plex-hero-bg" style="background-image:url('${bg}')"></div>
+      <div class="plex-hero-bg"></div>
       <div class="plex-hero-scrim"></div>
       <div class="plex-hero-title-block">${titleInner}</div>
       <div class="plex-hero-bottom-block">
@@ -844,6 +1065,7 @@ function buildHero(items, info, machineIdentifier) {
         ${meta     ? `<div class="plex-hero-meta">${esc(meta)}</div>`     : ''}
         ${summary  ? `<div class="plex-hero-summary">${summary}</div>`    : ''}
       </div>`;
+    slide.querySelector('.plex-hero-bg').style.backgroundImage = cssUrl(bg);
     slide.style.cursor = 'pointer';
     const logoImg = slide.querySelector('.plex-hero-logo');
     if (logoImg) {
@@ -863,8 +1085,9 @@ function buildHero(items, info, machineIdentifier) {
     slide.addEventListener('click', e => {
       if (e.target.closest('.plex-hero-btn, .plex-hero-dot')) return;
       const key = `/library/metadata/${item.ratingKey}`;
-      if (machineIdentifier) location.hash = `#!/server/${machineIdentifier}/details?key=${encodeURIComponent(key)}`;
-      else location.href = `${info.base}${key}?X-Plex-Token=${info.token}`;
+      const open = id => { if (id) location.hash = `#!/server/${id}/details?key=${encodeURIComponent(key)}`; };
+      if (machineIdentifier) open(machineIdentifier);
+      else fetchMachineIdentifier(info).then(id => { machineIdentifier = id; open(id); });   // no raw API URL fallback: it leaks the token into history
     });
     track.appendChild(slide);
   });
@@ -955,7 +1178,7 @@ function buildHero(items, info, machineIdentifier) {
     trailerTimer = setTimeout(async () => {
       trailerTimer = null;
       if (item._trailer === undefined) item._trailer = await fetchTrailer(info, item);   // resolve once, cache
-      if (heroSlide !== idx || document.hidden || !heroInView || !hovering || !item._trailer) return;   // only while hovering this slide, in view
+      if (disposed || heroSlide !== idx || document.hidden || !heroInView || !hovering || !item._trailer) return;   // only while hovering this slide, in view
       const slideEl = hero.querySelectorAll('.plex-hero-slide')[idx];
       if (slideEl) startTrailer(slideEl, item._trailer);
     }, HERO_TRAILER_DELAY_MS);
@@ -978,11 +1201,12 @@ function buildHero(items, info, machineIdentifier) {
     ambient.style.opacity = '0';
     if (globalAmbientEl) globalAmbientEl.style.opacity = '0';
     setTimeout(() => {
+      if (disposed) return;
       const artUrl = plexArtUrl(info, items[heroSlide].art);
-      ambient.style.backgroundImage = `url('${artUrl}')`;
+      ambient.style.backgroundImage = cssUrl(artUrl);
       ambient.style.opacity = HERO_AMBIENT_OPACITY;
       if (globalAmbientEl) {
-        globalAmbientEl.style.backgroundImage = `url('${artUrl}')`;
+        globalAmbientEl.style.backgroundImage = cssUrl(artUrl);
         globalAmbientEl.style.opacity = AMBIENT_OPACITY;
       }
     }, 350);
@@ -1020,6 +1244,7 @@ function buildHero(items, info, machineIdentifier) {
   io.observe(hero);
 
   heroDispose = () => {                 // dispose this instance before a rebuild (no stale observers/timers/video)
+    disposed = true;
     io.disconnect();
     document.removeEventListener('visibilitychange', onVisibility);
     stopAuto();
@@ -1051,8 +1276,10 @@ function shiftHub(hub, offset) {
 
 function pushHubsDown() {
   if (!heroEl || !heroEl.isConnected) return;
+  const hubs = document.querySelectorAll('[class*="VirtualHubScroller-hub"]:not([data-plex-hero-shifted]):not([data-plex-hero-flow])');
+  if (!hubs.length) return;   // runs on every mutation batch — skip the forced layout when nothing is new
   const offset = heroOuterHeight();
-  document.querySelectorAll('[class*="VirtualHubScroller-hub"]:not([data-plex-hero-shifted]):not([data-plex-hero-flow])').forEach(hub => {
+  hubs.forEach(hub => {
     // Most Plex builds lay hubs out in normal document flow (position: static/relative),
     // so the relatively-positioned hero already displaces them — nothing to shift.
     // Only builds that absolutely-position hubs (inline `top`) need a manual offset.
@@ -1076,8 +1303,11 @@ function pushHubsDown() {
   });
 }
 
+const HERO_INIT_RETRY_MS = 60000;   // wait this long after a failed init (no libraries, server offline…)
+
 async function initCarousel() {
   if (heroInitInProgress || (heroEl && heroEl.isConnected)) return;
+  if (Date.now() - heroInitFailedAt < HERO_INIT_RETRY_MS) { removeSkeleton(); return; }
   const info = getServerInfo();
   if (!info) return;                    // auth not ready yet — let next mutation retry
   heroInitInProgress = true;
@@ -1086,9 +1316,11 @@ async function initCarousel() {
     ({ items, machineIdentifier } = await fetchRecentItems(info));
   } catch {
     heroInitInProgress = false;
-    return;                             // leave skeleton up; timeout will clear it
+    heroInitFailedAt = Date.now();
+    removeSkeleton();
+    return;
   }
-  if (!items || items.length < 2) { heroInitInProgress = false; return; }
+  if (!items || items.length < 2) { heroInitInProgress = false; heroInitFailedAt = Date.now(); removeSkeleton(); return; }
   if (!isHomePage())              { heroInitInProgress = false; return; }   // navigated to an excluded route mid-fetch
   if (heroEl && heroEl.isConnected)   { heroInitInProgress = false; return; }
   const firstHub = findFirstHub();
@@ -1099,6 +1331,7 @@ async function initCarousel() {
   heroInitInProgress = false;
   requestAnimationFrame(() => requestAnimationFrame(() => {
     pushHubsDown();
+    enableScrollSnap();
     setTimeout(removeSkeleton, 450);
   }));
 }
@@ -1110,7 +1343,7 @@ function guardCarousel() {
   const firstHub = findFirstHub();
   if (firstHub && !firstHub.parentElement.querySelector('#plex-hero')) {
     firstHub.parentElement.insertBefore(heroEl, firstHub);
-    requestAnimationFrame(() => requestAnimationFrame(() => { pushHubsDown(); removeSkeleton(); }));
+    requestAnimationFrame(() => requestAnimationFrame(() => { pushHubsDown(); enableScrollSnap(); removeSkeleton(); }));
   }
 }
 
